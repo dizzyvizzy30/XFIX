@@ -46,7 +46,7 @@ If a model call fails, XFIX keeps going: the review falls back to ASI:One, and t
 
 | Sponsor | What XFIX uses | Job |
 |---|---|---|
-| Meta | Meta Model API, `muse-spark-1.3` | Writes the review findings |
+| Meta | Meta Model API, `muse-spark-1.3` | Writes the review findings and the fix, via JSON-schema structured outputs |
 | Fetch.ai | uAgents, Agentverse mailbox, ASI:One chat and model | Chat entry point, agent runtime, cross-checker |
 | Subquadratic | SubQ Snap 1.1 decision API | Merge verdict and block score |
 | MongoDB | Atlas (`xfix.runs`, `xfix.lessons`) | Run history and lessons that improve later reviews |

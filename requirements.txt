@@ -1,5 +1,5 @@
-uagents
-openai
-python-dotenv
-pymongo
-requests
+uagents==0.26.1
+openai==3.46.0
+python-dotenv==1.2.4
+pymongo==4.19.0
+requests==2.34.2

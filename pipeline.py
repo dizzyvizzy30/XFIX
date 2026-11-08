@@ -1,7 +1,7 @@
 """XFIX review pipeline.
 
-PR link -> diff from GitHub -> lessons from MongoDB -> Meta Muse review
--> ASI:One cross-check -> SubQ Snap merge verdict -> run saved to MongoDB.
+PR link -> diff from GitHub -> lessons from MongoDB -> Meta Muse and ASI:One review in parallel
+-> keep findings both found -> SubQ Snap merge verdict -> fix loop -> run saved to MongoDB.
 
 Run it on its own to test without the chat agent:
     python pipeline.py https://github.com/<owner>/<repo>/pull/<number>
@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import requests
@@ -44,13 +45,6 @@ Return JSON only, in this shape:
 {"findings": [{"file": "path", "line": 12, "severity": "high|medium|low",
   "title": "short name of the problem", "reason": "one sentence on why it is a problem"}]}
 Return {"findings": []} if the change is safe to merge."""
-
-CHECK_PROMPT = """You are verifying another reviewer's findings on a pull request.
-For each numbered finding, decide whether it is a real problem in this diff.
-Reject findings that are wrong, speculative, or not caused by this change.
-
-Return JSON only, in this shape:
-{"checks": [{"id": 1, "confirmed": true, "note": "one short sentence"}]}"""
 
 # Meta Model API structured output: decoding is constrained to this schema,
 # so the review reply is always parseable JSON with all fields present.
@@ -130,44 +124,68 @@ def load_lessons(repo):
     return lessons
 
 
+def review_with(client, model, fmt, user):
+    """One reviewer's findings. Meta uses structured output; ASI:One replies with plain JSON."""
+    reply = ask(client, model, REVIEW_PROMPT, user, 8000, fmt)
+    try:
+        findings = json.loads(reply or "").get("findings", [])
+    except (ValueError, AttributeError):
+        findings = parse_json(reply).get("findings", [])
+    return [f for f in findings if isinstance(f, dict) and f.get("title")]
+
+
 def review(diff, lessons):
-    """Meta Muse writes the findings via structured output. Falls back to ASI:One if the Meta call fails."""
+    """Meta Muse and ASI:One review the diff at the same time, independently.
+
+    Returns (reviewer, findings, second_opinion). Meta's findings are primary; second_opinion
+    is ASI:One's own findings, or None when only one model answered.
+    """
     user = f"Diff:\n{diff[:MAX_REVIEW_CHARS]}"
     if lessons:
         past = "\n".join(f"- {l['title']} ({l['file']}): {l['reason']}" for l in lessons)
         user = f"Problems confirmed in earlier reviews. Check whether this change repeats any:\n{past}\n\n{user}"
-    attempts = (("Meta Muse", meta, META_MODEL, FINDINGS_SCHEMA),
-                ("ASI:One", asi1, ASI1_MODEL, None))
-    for name, client, model, fmt in attempts:
-        try:
-            reply = ask(client, model, REVIEW_PROMPT, user, 8000, fmt)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = {"Meta Muse": pool.submit(review_with, meta, META_MODEL, FINDINGS_SCHEMA, user),
+                "ASI:One": pool.submit(review_with, asi1, ASI1_MODEL, None, user)}
+        results = {}
+        for name, job in jobs.items():
             try:
-                findings = json.loads(reply or "").get("findings", [])
-            except (ValueError, AttributeError):
-                findings = parse_json(reply).get("findings", [])
-            return name, [f for f in findings if isinstance(f, dict) and f.get("title")]
-        except Exception as e:
-            print(f"[xfix] {name} review failed: {e}", file=sys.stderr)
+                results[name] = job.result()
+            except Exception as e:
+                print(f"[xfix] {name} review failed: {e}", file=sys.stderr)
+    if "Meta Muse" in results:
+        return "Meta Muse", results["Meta Muse"], results.get("ASI:One")
+    if "ASI:One" in results:
+        return "ASI:One", results["ASI:One"], None
     raise RuntimeError("both reviewer models failed")
 
 
-def cross_check(diff, findings):
-    """ASI:One confirms or rejects each finding. confirmed=None means it could not be checked."""
-    if not findings:
-        return findings
-    numbered = "\n".join(f"{i}. [{f.get('severity', '?')}] {f.get('file')}:{f.get('line')} "
-                         f"{f['title']}: {f.get('reason', '')}" for i, f in enumerate(findings, 1))
+def words(finding):
+    text = f"{finding.get('title', '')} {finding.get('reason', '')}".lower()
+    return {w for w in re.findall(r"[a-z]+", text) if len(w) > 3}
+
+
+def same_problem(a, b):
+    """Two findings describe the same problem: same file, and nearby lines or overlapping wording."""
+    if os.path.basename(str(a.get("file") or "")) != os.path.basename(str(b.get("file") or "")):
+        return False
     try:
-        reply = ask(asi1, ASI1_MODEL, CHECK_PROMPT,
-                    f"Findings:\n{numbered}\n\nDiff:\n{diff[:MAX_REVIEW_CHARS]}", 3000)
-        checks = {c.get("id"): c for c in parse_json(reply).get("checks", [])}
-    except Exception as e:
-        print(f"[xfix] ASI:One cross-check failed: {e}", file=sys.stderr)
-        checks = {}
-    for i, f in enumerate(findings, 1):
-        c = checks.get(i)
-        f["confirmed"] = bool(c.get("confirmed")) if c else None
-        f["check_note"] = c.get("note", "") if c else ""
+        if abs(int(a.get("line")) - int(b.get("line"))) <= 10:
+            return True
+    except (TypeError, ValueError):
+        pass
+    wa, wb = words(a), words(b)
+    return len(wa & wb) / max(1, len(wa | wb)) >= 0.2
+
+
+def cross_check(findings, second_opinion):
+    """Keep Meta's findings that ASI:One also found on its own. confirmed=None means no second opinion."""
+    for f in findings:
+        if second_opinion is None:
+            f["confirmed"], f["check_note"] = None, ""
+        else:
+            f["confirmed"] = any(same_problem(f, g) for g in second_opinion)
+            f["check_note"] = "ASI:One found this too" if f["confirmed"] else "ASI:One did not find this"
     return findings
 
 
@@ -202,14 +220,16 @@ def finding_lines(findings):
 
 def evaluate(label, diff, lessons, say=lambda _m: None, heading=lambda name, n: f"### {name}"):
     """One review pass: Meta findings, ASI:One cross-check, SubQ verdict. `say` posts progress to chat."""
-    reviewer, findings = review(diff, lessons)
-    found = f"Found {len(findings)} possible problem(s):\n{finding_lines(findings)}" if findings else "No problems found."
+    reviewer, findings, second = review(diff, lessons)
+    found = f"Meta Muse found {len(findings)} possible problem(s):\n{finding_lines(findings)}" if findings else "Meta Muse found no problems."
+    other = f"\nASI:One found {len(second)} on its own." if second is not None else ""
     by = "" if reviewer == "Meta Muse" else f"\n(Meta was unavailable, so {reviewer} reviewed.)"
-    say(f"{heading('Meta Muse review', 2)}\n{found}{by}\n\n_Now: ASI:One is checking each finding._")
+    say(f"{heading('Meta Muse + ASI:One review (in parallel)', 2)}\n{found}{other}{by}"
+        "\n\n_Now: matching the two reviews._")
 
-    findings = cross_check(diff, findings)
+    findings = cross_check(findings, second)
     kept = [f for f in findings if f.get("confirmed") is not False]
-    say(f"{heading('ASI:One cross-check', 3)}\n{len(kept)} confirmed, {len(findings) - len(kept)} dropped as false alarms."
+    say(f"{heading('Cross-check', 3)}\n{len(kept)} found by both models, {len(findings) - len(kept)} dropped as false alarms."
         "\n\n_Now: SubQ Snap is scoring the merge risk._")
 
     judge_name, block_probability = judge(label, diff, kept)
@@ -257,7 +277,7 @@ def format_reply(run, run_number):
         "",
     ]
     if kept:
-        lines.append(f"**Confirmed findings** (reviewed by {run['reviewer']}, checked by ASI:One):")
+        lines.append(f"**Confirmed findings** (found by {run['reviewer']} and ASI:One independently):")
         for i, f in enumerate(kept, 1):
             where = f"{f.get('file')}:{f.get('line')}" if f.get("line") else f.get("file")
             flag = "" if f.get("confirmed") else " _(not cross-checked)_"
@@ -265,7 +285,7 @@ def format_reply(run, run_number):
     else:
         lines.append("No confirmed problems found.")
     if dropped:
-        lines += ["", f"Dropped {len(dropped)} finding(s) that ASI:One could not confirm:"]
+        lines += ["", f"Dropped {len(dropped)} finding(s) that ASI:One did not find on its own:"]
         lines += [f"- {f['title']}" for f in dropped]
     fix = run.get("fix")
     if fix:
@@ -307,7 +327,7 @@ def run_review(text, progress=None):
 
     lessons = load_lessons(repo_full)
     say(f"### Stage 1 of 5: Fetch\nDownloaded the diff ({len(diff):,} characters) and loaded {len(lessons)} "
-        "lesson(s) from past runs in MongoDB.\n\n_Now: Meta Muse is reviewing the diff._")
+        "lesson(s) from past runs in MongoDB.\n\n_Now: Meta Muse and ASI:One are reviewing the diff in parallel._")
     first = evaluate(label, diff, lessons, say, lambda name, n: f"### Stage {n} of 5: {name}")
 
     # Fix loop: while the merge judge blocks, Meta writes a fix and XFIX re-reviews it.
