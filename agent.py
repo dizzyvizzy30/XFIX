@@ -67,7 +67,7 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
     if PR_URL.search(text) or "diff --git" in text:
         await ctx.send(sender, text_message(
             "XFIX is reviewing this change: Meta Muse review, ASI:One cross-check, "
-            "then a SubQ Snap merge verdict. This takes about a minute."))
+            "a SubQ Snap merge verdict, and a fix if it's blocked. This takes about a minute."))
 
     # the pipeline makes blocking network calls, so run it off the event loop
     try:

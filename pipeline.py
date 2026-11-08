@@ -24,6 +24,8 @@ PR_URL = re.compile(r"https?://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)")
 MAX_REVIEW_CHARS = 60_000   # diff sent to the reviewer models
 MAX_JUDGE_CHARS = 400_000   # SubQ Snap has a 384k-token window
 LESSON_LIMIT = 5
+MAX_FIX_ATTEMPTS = 2
+FIX_PREVIEW_LINES = 40      # lines of the fix diff shown in chat
 
 META_MODEL = "muse-spark-1.3"
 ASI1_MODEL = "asi1"
@@ -49,6 +51,11 @@ Reject findings that are wrong, speculative, or not caused by this change.
 
 Return JSON only, in this shape:
 {"checks": [{"id": 1, "confirmed": true, "note": "one short sentence"}]}"""
+
+FIX_PROMPT = """You are XFIX's fixer. Rewrite the pull request so every confirmed problem is fixed
+while keeping what the author was trying to do.
+Return only the corrected change as a unified diff against the same base, starting with "diff --git".
+No commentary."""
 
 
 def parse_json(text):
@@ -150,6 +157,32 @@ def judge(label, diff, kept):
         return "fallback rule", 0.9 if "high" in severities else 0.6 if kept else 0.1
 
 
+def evaluate(label, diff, lessons):
+    """One review pass: Meta findings, ASI:One cross-check, SubQ verdict."""
+    reviewer, findings = review(diff, lessons)
+    findings = cross_check(diff, findings)
+    kept = [f for f in findings if f.get("confirmed") is not False]
+    judge_name, block_probability = judge(label, diff, kept)
+    return {"reviewer": reviewer, "judge": judge_name, "findings": findings,
+            "kept": kept, "block_probability": block_probability}
+
+
+def propose_fix(diff, kept):
+    """Meta Muse rewrites the change so the confirmed problems are gone."""
+    problems = "\n".join(f"- {f.get('file')}:{f.get('line')} {f['title']}: {f.get('reason', '')}"
+                         for f in kept) or "- the merge judge blocked this change"
+    try:
+        reply = ask(meta, META_MODEL, FIX_PROMPT,
+                    f"Confirmed problems:\n{problems}\n\nOriginal diff:\n{diff[:MAX_REVIEW_CHARS]}", 8000) or ""
+    except Exception as e:
+        print(f"[xfix] Meta fix failed: {e}", file=sys.stderr)
+        return ""
+    fenced = re.search(r"```(?:diff|patch)?\s*(diff --git.*?)```", reply, re.S)
+    if fenced:
+        return fenced.group(1).strip()
+    return reply[reply.find("diff --git"):].strip() if "diff --git" in reply else ""
+
+
 def save_run(run, kept):
     db.runs.insert_one(run)
     now = datetime.now(timezone.utc)
@@ -182,6 +215,18 @@ def format_reply(run, run_number):
     if dropped:
         lines += ["", f"Dropped {len(dropped)} finding(s) that ASI:One could not confirm:"]
         lines += [f"- {f['title']}" for f in dropped]
+    fix = run.get("fix")
+    if fix:
+        fixed_ok = fix["block_probability"] < 0.5
+        still = [f for f in fix["findings"] if f.get("confirmed") is not False]
+        preview = fix["diff"].splitlines()
+        if len(preview) > FIX_PREVIEW_LINES:
+            preview = preview[:FIX_PREVIEW_LINES] + [f"... ({len(fix['diff'].splitlines()) - FIX_PREVIEW_LINES} more lines)"]
+        lines += ["", f"**XFIX fix** (written by Meta Muse, attempt {fix['attempts']}):",
+                  "```diff", *preview, "```",
+                  f"**Re-review of the fix: {'APPROVE' if fixed_ok else 'STILL BLOCKED'}** "
+                  f"(block score {run['block_probability']:.2f} → {fix['block_probability']:.2f}, "
+                  f"{len(still)} confirmed finding(s) left, judged by {fix['judge']})"]
     lines += ["", f"Run #{run_number} saved to MongoDB. Lessons used from past runs: {run['lessons_used']}. "
                   f"Took {run['seconds']:.0f}s."]
     return "\n".join(lines)
@@ -206,19 +251,29 @@ def run_review(text):
         return HELP
 
     lessons = load_lessons(repo_full)
-    reviewer, findings = review(diff, lessons)
-    findings = cross_check(diff, findings)
-    kept = [f for f in findings if f.get("confirmed") is not False]
-    judge_name, block_probability = judge(label, diff, kept)
+    first = evaluate(label, diff, lessons)
+
+    # Fix loop: while the merge judge blocks, Meta writes a fix and XFIX re-reviews it.
+    fix, current, current_diff = None, first, diff
+    for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
+        if current["block_probability"] < 0.5:
+            break
+        fixed_diff = propose_fix(current_diff, current["kept"])
+        if not fixed_diff:
+            break
+        current, current_diff = evaluate(f"{label} (XFIX fix {attempt})", fixed_diff, lessons), fixed_diff
+        fix = {"attempts": attempt, "diff": fixed_diff, "reviewer": current["reviewer"],
+               "judge": current["judge"], "findings": current["findings"],
+               "block_probability": current["block_probability"]}
 
     run = {
         "label": label, "repo": repo_full, "url": m.group(0) if m else None,
-        "diff_chars": len(diff), "reviewer": reviewer, "judge": judge_name,
-        "findings": findings, "block_probability": block_probability,
-        "lessons_used": len(lessons), "seconds": time.time() - started,
+        "diff_chars": len(diff), "reviewer": first["reviewer"], "judge": first["judge"],
+        "findings": first["findings"], "block_probability": first["block_probability"],
+        "fix": fix, "lessons_used": len(lessons), "seconds": time.time() - started,
         "created_at": datetime.now(timezone.utc),
     }
-    return format_reply(run, save_run(run, kept))
+    return format_reply(run, save_run(run, first["kept"]))
 
 
 if __name__ == "__main__":
