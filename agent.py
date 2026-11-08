@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from uagents import Context, Protocol, Agent
+from uagents import Context, Model, Protocol, Agent
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
     ChatMessage,
@@ -34,6 +34,17 @@ agent = Agent(
     mailbox=True,
     publish_agent_details=True,
 )
+
+class Health(Model):
+    status: str
+
+
+@agent.on_rest_get("/health", Health)
+async def health(ctx: Context):
+    # A local endpoint keeps the agent's web server (and its inspector link)
+    # alive in mailbox mode; the SDK skips the server otherwise.
+    return Health(status="ok")
+
 
 # We create a new protocol which is compatible with the chat protocol spec. This ensures
 # compatibility between agents
