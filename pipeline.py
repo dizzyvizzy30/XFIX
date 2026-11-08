@@ -52,6 +52,37 @@ Reject findings that are wrong, speculative, or not caused by this change.
 Return JSON only, in this shape:
 {"checks": [{"id": 1, "confirmed": true, "note": "one short sentence"}]}"""
 
+# Meta Model API structured output: decoding is constrained to this schema,
+# so the review reply is always parseable JSON with all fields present.
+FINDINGS_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "review_findings",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "file": {"type": "string"},
+                            "line": {"type": "integer"},
+                            "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                            "title": {"type": "string"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["file", "line", "severity", "title", "reason"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["findings"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 FIX_PROMPT = """You are XFIX's fixer. Rewrite the pull request so every confirmed problem is fixed
 while keeping what the author was trying to do.
 Return only the corrected change as a unified diff against the same base, starting with "diff --git".
@@ -70,11 +101,13 @@ def parse_json(text):
     return json.loads(text[start:end + 1])
 
 
-def ask(client, model, system, user, max_tokens):
+def ask(client, model, system, user, max_tokens, response_format=None):
+    kwargs = {"response_format": response_format} if response_format is not None else {}
     r = client.chat.completions.create(
         model=model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         max_tokens=max_tokens,
+        **kwargs,
     )
     return r.choices[0].message.content
 
@@ -98,14 +131,20 @@ def load_lessons(repo):
 
 
 def review(diff, lessons):
-    """Meta Muse writes the findings. Falls back to ASI:One if the Meta call fails."""
+    """Meta Muse writes the findings via structured output. Falls back to ASI:One if the Meta call fails."""
     user = f"Diff:\n{diff[:MAX_REVIEW_CHARS]}"
     if lessons:
         past = "\n".join(f"- {l['title']} ({l['file']}): {l['reason']}" for l in lessons)
         user = f"Problems confirmed in earlier reviews. Check whether this change repeats any:\n{past}\n\n{user}"
-    for name, client, model in (("Meta Muse", meta, META_MODEL), ("ASI:One", asi1, ASI1_MODEL)):
+    attempts = (("Meta Muse", meta, META_MODEL, FINDINGS_SCHEMA),
+                ("ASI:One", asi1, ASI1_MODEL, None))
+    for name, client, model, fmt in attempts:
         try:
-            findings = parse_json(ask(client, model, REVIEW_PROMPT, user, 8000)).get("findings", [])
+            reply = ask(client, model, REVIEW_PROMPT, user, 8000, fmt)
+            try:
+                findings = json.loads(reply or "").get("findings", [])
+            except (ValueError, AttributeError):
+                findings = parse_json(reply).get("findings", [])
             return name, [f for f in findings if isinstance(f, dict) and f.get("title")]
         except Exception as e:
             print(f"[xfix] {name} review failed: {e}", file=sys.stderr)
@@ -157,12 +196,25 @@ def judge(label, diff, kept):
         return "fallback rule", 0.9 if "high" in severities else 0.6 if kept else 0.1
 
 
-def evaluate(label, diff, lessons):
-    """One review pass: Meta findings, ASI:One cross-check, SubQ verdict."""
+def finding_lines(findings):
+    return "\n".join(f"- [{f.get('severity', '?')}] `{f.get('file')}:{f.get('line')}` {f['title']}" for f in findings)
+
+
+def evaluate(label, diff, lessons, say=lambda _m: None, heading=lambda name, n: f"### {name}"):
+    """One review pass: Meta findings, ASI:One cross-check, SubQ verdict. `say` posts progress to chat."""
     reviewer, findings = review(diff, lessons)
+    found = f"Found {len(findings)} possible problem(s):\n{finding_lines(findings)}" if findings else "No problems found."
+    by = "" if reviewer == "Meta Muse" else f"\n(Meta was unavailable, so {reviewer} reviewed.)"
+    say(f"{heading('Meta Muse review', 2)}\n{found}{by}\n\n_Now: ASI:One is checking each finding._")
+
     findings = cross_check(diff, findings)
     kept = [f for f in findings if f.get("confirmed") is not False]
+    say(f"{heading('ASI:One cross-check', 3)}\n{len(kept)} confirmed, {len(findings) - len(kept)} dropped as false alarms."
+        "\n\n_Now: SubQ Snap is scoring the merge risk._")
+
     judge_name, block_probability = judge(label, diff, kept)
+    verdict = "REQUEST CHANGES" if block_probability >= 0.5 else "APPROVE"
+    say(f"{heading('SubQ Snap merge verdict', 4)}\nBlock score {block_probability:.2f}: **{verdict}**.")
     return {"reviewer": reviewer, "judge": judge_name, "findings": findings,
             "kept": kept, "block_probability": block_probability}
 
@@ -236,32 +288,44 @@ HELP = ("Send me a GitHub pull request link, like https://github.com/owner/repo/
         "or paste a unified diff. I'll review it and tell you whether it's safe to merge.")
 
 
-def run_review(text):
-    """Full pipeline for one chat message. Returns the reply text."""
+def run_review(text, progress=None):
+    """Full pipeline for one chat message. Returns the reply text; `progress` gets one message per stage."""
+    say = progress or (lambda _m: None)
     started = time.time()
     m = PR_URL.search(text)
     if m:
         owner, repo, number = m.groups()
         repo_full, label = f"{owner}/{repo}", f"{owner}/{repo}#{number}"
+        say(f"## XFIX review started\nPR: {label}\n\n_Now: downloading the diff from GitHub._")
         diff = fetch_diff(owner, repo, number)
     elif "diff --git" in text:
         repo_full, label = "pasted", "pasted diff"
+        say("## XFIX review started\nReviewing the pasted diff.")
         diff = text[text.index("diff --git"):]
     else:
         return HELP
 
     lessons = load_lessons(repo_full)
-    first = evaluate(label, diff, lessons)
+    say(f"### Stage 1 of 5: Fetch\nDownloaded the diff ({len(diff):,} characters) and loaded {len(lessons)} "
+        "lesson(s) from past runs in MongoDB.\n\n_Now: Meta Muse is reviewing the diff._")
+    first = evaluate(label, diff, lessons, say, lambda name, n: f"### Stage {n} of 5: {name}")
 
     # Fix loop: while the merge judge blocks, Meta writes a fix and XFIX re-reviews it.
     fix, current, current_diff = None, first, diff
+    if first["block_probability"] < 0.5:
+        say("### Stage 5 of 5: Fix loop\nNo fix needed. The change is safe to merge.")
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
         if current["block_probability"] < 0.5:
             break
+        say(f"### Stage 5 of 5: Fix loop (attempt {attempt})\nThe merge is blocked, so Meta Muse is writing a fix "
+            f"for {len(current['kept'])} confirmed problem(s).")
         fixed_diff = propose_fix(current_diff, current["kept"])
         if not fixed_diff:
+            say("#### Fix failed\nMeta Muse could not produce a fix. Sending the review as it is.")
             break
-        current, current_diff = evaluate(f"{label} (XFIX fix {attempt})", fixed_diff, lessons), fixed_diff
+        say(f"#### Fix written\n{len(fixed_diff.splitlines())} lines. Re-checking it with Meta Muse, ASI:One and SubQ Snap.")
+        current, current_diff = evaluate(f"{label} (XFIX fix {attempt})", fixed_diff, lessons, say,
+                                         lambda name, n: f"#### Re-check: {name}"), fixed_diff
         fix = {"attempts": attempt, "diff": fixed_diff, "reviewer": current["reviewer"],
                "judge": current["judge"], "findings": current["findings"],
                "block_probability": current["block_probability"]}
@@ -277,4 +341,5 @@ def run_review(text):
 
 
 if __name__ == "__main__":
-    print(run_review(" ".join(sys.argv[1:]) or "https://github.com/fetchai/uAgents/pull/610"))
+    print(run_review(" ".join(sys.argv[1:]) or "https://github.com/fetchai/uAgents/pull/610",
+                     progress=lambda msg: print(msg + "\n---", file=sys.stderr)))

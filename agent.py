@@ -13,7 +13,7 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
 )
 
-from pipeline import HELP, PR_URL, run_review
+from pipeline import HELP, run_review
 
 ### XFIX: pre-merge verifier agent
 
@@ -64,14 +64,18 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
             text += item.text
     ctx.logger.info(f"Review request from {sender}: {text[:200]}")
 
-    if PR_URL.search(text) or "diff --git" in text:
-        await ctx.send(sender, text_message(
-            "XFIX is reviewing this change: Meta Muse review, ASI:One cross-check, "
-            "a SubQ Snap merge verdict, and a fix if it's blocked. This takes about a minute."))
+    # the pipeline runs in a worker thread; this posts each stage's update back to the chat
+    loop = asyncio.get_running_loop()
+
+    def progress(update):
+        try:
+            asyncio.run_coroutine_threadsafe(ctx.send(sender, text_message(update)), loop).result(timeout=30)
+        except Exception:
+            ctx.logger.exception('Could not send progress update')
 
     # the pipeline makes blocking network calls, so run it off the event loop
     try:
-        response = await asyncio.to_thread(run_review, text)
+        response = await asyncio.to_thread(run_review, text, progress)
     except Exception as e:
         ctx.logger.exception('Review failed')
         response = f"XFIX could not finish this review: {e}\n\n{HELP}"
