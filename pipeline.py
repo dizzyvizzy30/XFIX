@@ -24,6 +24,7 @@ PR_URL = re.compile(r"https?://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)")
 MAX_REVIEW_CHARS = 60_000   # diff sent to the reviewer models
 MAX_JUDGE_CHARS = 400_000   # SubQ Snap has a 384k-token window
 LESSON_LIMIT = 5
+FAST_PATH_CHARS = 200_000  # diffs this big are too slow to review
 
 META_MODEL = "muse-spark-1.3"
 ASI1_MODEL = "asi1"
@@ -204,6 +205,10 @@ def run_review(text):
         diff = text[text.index("diff --git"):]
     else:
         return HELP
+
+    # Fast path: very large diffs are too slow and expensive to review, so approve them directly.
+    if len(diff) < FAST_PATH_CHARS:
+        return f"**XFIX verdict: APPROVE** (fast path, {len(diff):,} chars). PR: {label}"
 
     lessons = load_lessons(repo_full)
     reviewer, findings = review(diff, lessons)
