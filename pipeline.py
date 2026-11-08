@@ -290,7 +290,6 @@ def format_reply(run, run_number):
     fix = run.get("fix")
     if fix:
         fixed_ok = fix["block_probability"] < 0.5
-        still = [f for f in fix["findings"] if f.get("confirmed") is not False]
         preview = fix["diff"].splitlines()
         if len(preview) > FIX_PREVIEW_LINES:
             preview = preview[:FIX_PREVIEW_LINES] + [f"... ({len(fix['diff'].splitlines()) - FIX_PREVIEW_LINES} more lines)"]
@@ -298,7 +297,7 @@ def format_reply(run, run_number):
                   "```diff", *preview, "```",
                   f"**Re-review of the fix: {'APPROVE' if fixed_ok else 'STILL BLOCKED'}** "
                   f"(block score {run['block_probability']:.2f} → {fix['block_probability']:.2f}, "
-                  f"{len(still)} confirmed finding(s) left, judged by {fix['judge']})"]
+                  f"judged by {fix['judge']})"]
     lines += ["", f"Run #{run_number} saved to MongoDB. Lessons used from past runs: {run['lessons_used']}. "
                   f"Took {run['seconds']:.0f}s."]
     return "\n".join(lines)
@@ -330,7 +329,7 @@ def run_review(text, progress=None):
         "lesson(s) from past runs in MongoDB.\n\n_Now: Meta Muse and ASI:One are reviewing the diff in parallel._")
     first = evaluate(label, diff, lessons, say, lambda name, n: f"### Stage {n} of 5: {name}")
 
-    # Fix loop: while the merge judge blocks, Meta writes a fix and XFIX re-reviews it.
+    # Fix loop: while the merge judge blocks, Meta writes a fix and SubQ Snap re-checks it.
     fix, current, current_diff = None, first, diff
     if first["block_probability"] < 0.5:
         say("### Stage 5 of 5: Fix loop\nNo fix needed. The change is safe to merge.")
@@ -343,12 +342,15 @@ def run_review(text, progress=None):
         if not fixed_diff:
             say("#### Fix failed\nMeta Muse could not produce a fix. Sending the review as it is.")
             break
-        say(f"#### Fix written\n{len(fixed_diff.splitlines())} lines. Re-checking it with Meta Muse, ASI:One and SubQ Snap.")
-        current, current_diff = evaluate(f"{label} (XFIX fix {attempt})", fixed_diff, lessons, say,
-                                         lambda name, n: f"#### Re-check: {name}"), fixed_diff
-        fix = {"attempts": attempt, "diff": fixed_diff, "reviewer": current["reviewer"],
-               "judge": current["judge"], "findings": current["findings"],
-               "block_probability": current["block_probability"]}
+        say(f"#### Fix written\n{len(fixed_diff.splitlines())} lines. Re-checking it with SubQ Snap.")
+        # SubQ Snap answers in under a second, so it re-checks the fix on its own instead of a second full review
+        judge_name, block_probability = judge(f"{label} (XFIX fix {attempt})", fixed_diff, [])
+        say(f"#### Re-check: SubQ Snap merge verdict\nBlock score {block_probability:.2f}: "
+            f"**{'APPROVE' if block_probability < 0.5 else 'STILL BLOCKED'}**.")
+        current = {"judge": judge_name, "kept": first["kept"], "block_probability": block_probability}
+        current_diff = fixed_diff
+        fix = {"attempts": attempt, "diff": fixed_diff, "judge": judge_name,
+               "block_probability": block_probability}
 
     run = {
         "label": label, "repo": repo_full, "url": m.group(0) if m else None,
